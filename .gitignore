@@ -1,0 +1,13 @@
+.dub/
+docs/_build/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*-test-*
+__test__*__
+__dummy.html
+*.lst
+dub.selections.json
