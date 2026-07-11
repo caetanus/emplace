@@ -216,6 +216,19 @@ struct HashMap(V)
 
     alias exists = contains;
 
+    /// The table's own stable copy of `k`'s key bytes, or null when absent. The
+    /// bytes outlive rehashes (rehash moves the slot array, never the key
+    /// memory) and stay valid until the entry is removed — so a caller can index
+    /// a key by slice without allocating a second copy.
+    const(char)[] storedKey(scope const(char)[] k) @nogc nothrow @trusted
+    {
+        if (used == 0)
+            return null;
+        bool found;
+        auto i = findSlot(k, fnv1a(k), found);
+        return found ? slots[i].key : null;
+    }
+
     bool remove(scope const(char)[] k)
     {
         if (used == 0)

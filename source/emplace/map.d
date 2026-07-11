@@ -50,6 +50,7 @@ struct Map(K, V)
 
     private Node* root;
     private size_t count;
+    private Node* freePool; // recycled node memory (singly linked via .parent)
 
     @disable this(this); // move-only: owns a raw node graph
 
@@ -70,11 +71,28 @@ struct Map(K, V)
 
     private Node* alloc(K key, V val) @nogc nothrow @trusted
     {
-        auto n = Mallocator.instance.make!Node;
+        Node* n;
+        if (freePool !is null) // reuse a recycled node — no malloc
+        {
+            n = freePool;
+            freePool = n.parent;
+        }
+        else
+            n = Mallocator.instance.make!Node;
         n.key = key;
         n.val = val;
+        n.left = n.right = n.parent = null;
         n.color = Color.red;
         return n;
+    }
+
+    // Run a node's K/V destructors and keep its raw memory for reuse instead of
+    // returning it to the OS — arm/disarm churn recycles nodes for free.
+    private void recycle(Node* z) @nogc nothrow @trusted
+    {
+        destroy!false(*z); // frees a value's owned resources (e.g. a Vector's array)
+        z.parent = freePool;
+        freePool = z;
     }
 
     private void rotateLeft(Node* x) @nogc nothrow
@@ -115,6 +133,7 @@ struct Map(K, V)
     void set(K key, V val) @nogc nothrow @trusted
     {
         Node* parent = null;
+        int lastCmp = 0;
         auto cur = root;
         while (cur !is null)
         {
@@ -125,13 +144,14 @@ struct Map(K, V)
                 return;
             }
             parent = cur;
+            lastCmp = c;
             cur = c < 0 ? cur.left : cur.right;
         }
         auto n = alloc(key, val);
         n.parent = parent;
         if (parent is null)
             root = n;
-        else if (cmpKey(key, parent.key) < 0)
+        else if (lastCmp < 0) // reuse the compare the loop already did
             parent.left = n;
         else
             parent.right = n;
@@ -197,6 +217,35 @@ struct Map(K, V)
     {
         auto n = find(key);
         return n is null ? null : &n.val;
+    }
+
+    /// Pointer to `key`'s value, inserting `val` first if the key is absent
+    /// (existing values are kept). One descent — no separate get-after-set.
+    V* getOrPut(K key, V val) @nogc nothrow @trusted return
+    {
+        Node* parent = null;
+        int lastCmp = 0;
+        auto cur = root;
+        while (cur !is null)
+        {
+            immutable c = cmpKey(key, cur.key);
+            if (c == 0)
+                return &cur.val; // already present: keep it
+            parent = cur;
+            lastCmp = c;
+            cur = c < 0 ? cur.left : cur.right;
+        }
+        auto n = alloc(key, val);
+        n.parent = parent;
+        if (parent is null)
+            root = n;
+        else if (lastCmp < 0)
+            parent.left = n;
+        else
+            parent.right = n;
+        count++;
+        insertFixup(n);
+        return &n.val;
     }
 
     private Node* find(K key) @nogc nothrow
@@ -279,6 +328,36 @@ struct Map(K, V)
     V* rightBound(K key, out K foundKey) @nogc nothrow return
     {
         auto n = floorNode(key);
+        if (n is null)
+            return null;
+        foundKey = n.key;
+        return &n.val;
+    }
+
+    private Node* upperNode(K key) @nogc nothrow
+    {
+        Node* best = null;
+        auto cur = root;
+        while (cur !is null)
+        {
+            if (cmpKey(key, cur.key) < 0) // cur.key > key: candidate, look left for a smaller one
+            {
+                best = cur;
+                cur = cur.left;
+            }
+            else // cur.key <= key: everything here is too small, go right
+                cur = cur.right;
+        }
+        return best;
+    }
+
+    /// Strict ceiling — `std::upper_bound` / Python `bisect_right`: value of the
+    /// smallest key **strictly greater** than `key`, its key via `foundKey`;
+    /// null when no key is greater. Everything to its left is the range `<= key`,
+    /// so `foreachRange(min, key)` drains exactly that prefix.
+    V* upperBound(K key, out K foundKey) @nogc nothrow return
+    {
+        auto n = upperNode(key);
         if (n is null)
             return null;
         foundKey = n.key;
@@ -373,7 +452,7 @@ struct Map(K, V)
         }
         if (yColor == Color.black)
             deleteFixup(x, xParent);
-        Mallocator.instance.dispose(z);
+        recycle(z); // keep the node memory for the next insert
         count--;
         return true;
     }
@@ -479,12 +558,90 @@ struct Map(K, V)
         return walk(n.right, dg);
     }
 
+    // --- range interface. D is range-oriented, so the tree is also a lazy,
+    // allocation-free forward range: in-order (ascending key) traversal driven
+    // by the nodes' parent pointers — no stack, no heap. Compose it with
+    // std.range / std.algorithm, or `foreach (e; map[]) { if (...) break; }`.
+
+    private static Node* leftmost(Node* n) @nogc nothrow
+    {
+        if (n is null)
+            return null;
+        while (n.left !is null)
+            n = n.left;
+        return n;
+    }
+
+    private static Node* succ(Node* n) @nogc nothrow
+    {
+        if (n.right !is null)
+            return leftmost(n.right);
+        auto p = n.parent;
+        while (p !is null && n is p.right) // climb until we ascend from a left child
+        {
+            n = p;
+            p = p.parent;
+        }
+        return p;
+    }
+
+    /// One entry of the range: the key by value, the value by reference.
+    static struct Entry
+    {
+        private Node* _n;
+        @property K key() const @nogc nothrow
+        {
+            return _n.key;
+        }
+
+        @property ref V value() @nogc nothrow
+        {
+            return _n.val;
+        }
+    }
+
+    struct Range
+    {
+        private Node* _cur;
+        @property bool empty() const @nogc nothrow
+        {
+            return _cur is null;
+        }
+
+        @property Entry front() @nogc nothrow
+        {
+            return Entry(_cur);
+        }
+
+        void popFront() @nogc nothrow
+        {
+            _cur = succ(_cur);
+        }
+
+        @property Range save() @nogc nothrow
+        {
+            return this;
+        }
+    }
+
+    /// Forward range over every entry, ascending by key.
+    Range opSlice() @nogc nothrow
+    {
+        return Range(leftmost(root));
+    }
+
     /// Free every node. Empty afterwards.
     void clear() @nogc nothrow @trusted
     {
         freeSubtree(root);
         root = null;
         count = 0;
+        while (freePool !is null) // return recycled node memory to the OS
+        {
+            auto n = freePool;
+            freePool = n.parent;
+            Mallocator.instance.deallocate((cast(void*) n)[0 .. Node.sizeof]);
+        }
     }
 
     private static void freeSubtree(Node* n) @nogc nothrow @trusted
@@ -744,11 +901,36 @@ struct OrderedSet(T)
     assert(m.rightBound("Z", fk) is null); // nothing <= "Z" (uppercase sorts first)
     assert(*m.rightBound("z", fk) == 3 && fk == "g"); // floor past the end
 
+    // upperBound (bisect_right): smallest key strictly greater than the arg
+    assert(*m.upperBound("c", fk) == 2 && fk == "e"); // exact hit skips to the next
+    assert(*m.upperBound("b", fk) == 1 && fk == "c"); // between keys
+    assert(*m.upperBound("Z", fk) == 0 && fk == "a"); // before everything
+    assert(m.upperBound("g", fk) is null); // nothing greater than the max
+
     // foreachRange [b, f] -> c, e (O(log n + hits), not a full walk)
     const(char)[][8] hit;
     size_t n = 0;
     m.foreachRange("b", "f", (ref k, ref v) { hit[n++] = k; return 0; });
     assert(n == 2 && hit[0] == "c" && hit[1] == "e");
+}
+
+@nogc nothrow unittest // getOrPut: insert-once + return live pointer; node recycling
+{
+    Map!(int, int) m;
+    assert(*m.getOrPut(5, 100) == 100); // inserted
+    assert(*m.getOrPut(5, 999) == 100); // present: kept, not overwritten
+    *m.getOrPut(5, 0) += 1; // mutate in place through the returned pointer
+    assert(*m.get(5) == 101 && m.length == 1);
+
+    // remove drains nodes into the free pool; re-inserting reuses that memory
+    foreach (i; 0 .. 200)
+        m.set(i, i);
+    foreach (i; 0 .. 200)
+        assert(m.remove(i));
+    assert(m.empty);
+    foreach (i; 0 .. 200)
+        m.set(i, i * 2); // served from the recycle pool, not fresh malloc
+    assert(m.length == 200 && *m.get(150) == 300);
 }
 
 @nogc nothrow unittest // OrderedSet: membership, in, dedup, ordered iteration
