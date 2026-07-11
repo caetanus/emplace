@@ -4,8 +4,9 @@ module emplace.map;
 // built on it. Neither automem nor Phobos offers a @nogc associative container
 // (std.container.rbtree is GC-backed; automem ships only Vector), so the tree
 // is hand-rolled: O(log n) insert/lookup/remove, in-order (sorted-key)
-// iteration, nodes allocated through std.experimental.allocator's Mallocator
-// (the allocator automem uses) and freed explicitly.
+// iteration, nodes allocated through a std.experimental.allocator allocator
+// (Mallocator by default — pass any other, e.g. a Region/FreeList arena, as the
+// third template argument) and freed/recycled explicitly.
 //
 // Keys compare with `cmpKey` (byte-lexicographic for const(char)[]). Both
 // containers are move-only (`@disable this(this)`): they own a raw node graph,
@@ -38,7 +39,7 @@ private enum Color : ubyte
     black
 }
 
-struct Map(K, V)
+struct Map(K, V, Allocator = Mallocator)
 {
     private struct Node
     {
@@ -78,7 +79,7 @@ struct Map(K, V)
             freePool = n.parent;
         }
         else
-            n = Mallocator.instance.make!Node;
+            n = Allocator.instance.make!Node;
         n.key = key;
         n.val = val;
         n.left = n.right = n.parent = null;
@@ -640,7 +641,7 @@ struct Map(K, V)
         {
             auto n = freePool;
             freePool = n.parent;
-            Mallocator.instance.deallocate((cast(void*) n)[0 .. Node.sizeof]);
+            Allocator.instance.deallocate((cast(void*) n)[0 .. Node.sizeof]);
         }
     }
 
@@ -650,18 +651,18 @@ struct Map(K, V)
             return;
         freeSubtree(n.left);
         freeSubtree(n.right);
-        Mallocator.instance.dispose(n);
+        Allocator.instance.dispose(n);
     }
 }
 
 /// The valueless companion: an ordered set on the same red-black tree.
-struct OrderedSet(T)
+struct OrderedSet(T, Allocator = Mallocator)
 {
     private struct Unit
     {
     }
 
-    private Map!(T, Unit) tree;
+    private Map!(T, Unit, Allocator) tree;
 
     @disable this(this); // move-only (owns the tree)
 
