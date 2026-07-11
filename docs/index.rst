@@ -76,9 +76,17 @@ Containers
    * ``foreachRange(lo, hi, dg)`` — O(log n + hits) range scan.
 
 ``OrderedSet!T`` (``emplace.map``)
-   The valueless companion: ``add`` / ``remove`` / ``in``, and set algebra
-   (``union_`` / ``intersection`` / ``difference`` / ``symmetricDifference``,
-   ``isSubsetOf`` / ``isSupersetOf``).
+   The ordered set — the valueless companion: ``add`` / ``remove`` / ``in``, and
+   set algebra (``union_`` / ``intersection`` / ``difference`` /
+   ``symmetricDifference``, ``isSubsetOf`` / ``isSupersetOf``).
+
+``HashMap!(K, V)`` (``emplace.hashmap``)
+   ``unordered_map`` — open-addressed hash table, linear probing with
+   backward-shift deletion (no tombstones), grows at 0.75 load.
+   ``set`` / ``get`` / ``remove`` / ``contains`` / ``opApply`` / ``clear``.
+
+``HashSet!K`` (``emplace.hashmap``)
+   ``unordered_set`` — ``add`` / ``remove`` / ``in`` / ``opApply``.
 
 Allocators
 ----------

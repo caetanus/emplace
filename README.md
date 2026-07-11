@@ -38,8 +38,11 @@ import emplace.map : Map, OrderedSet;
 - **`emplace.map.Map!(K, V)`** — an ordered map on a hand-rolled red-black tree
   (O(log n) insert/lookup/remove, sorted iteration, `leftBound`/`rightBound`
   floor/ceiling + `foreachRange`).
-- **`emplace.map.OrderedSet!T`** — the valueless companion (union / intersection /
-  difference / symmetric difference, subset / superset).
+- **`emplace.map.OrderedSet!T`** — the ordered set: the valueless companion
+  (union / intersection / difference / symmetric difference, subset / superset).
+- **`emplace.hashmap.HashMap!(K, V)`** — `unordered_map`: open-addressed hash
+  table, linear probing with backward-shift deletion (no tombstones).
+- **`emplace.hashmap.HashSet!K`** — `unordered_set`.
 
 ## Allocators
 
@@ -76,7 +79,12 @@ buf.put(cast(const(ubyte)[]) "hello");  // one memcpy, no per-byte loop
 
 ## Acknowledgements
 
-`emplace` is inspired by **[automem](https://github.com/atilaneves/automem)** by
+`emplace` was originally built for **[dreads](https://github.com/caetanus/dreads)**,
+a GC-free Redis/Valkey-compatible database in D, whose data plane runs with the
+collector disabled — so it needed exactly these containers without C-isms. It is
+extracted here as a standalone, reusable package.
+
+It is inspired by **[automem](https://github.com/atilaneves/automem)** by
 **Atila Neves**, which pioneered allocator-aware smart pointers and a vector for
 D. `emplace` carries that idea forward with a wider container set, libc++/Rust
 semantics, and fixes for issues that surface on current compilers. Credit for the
