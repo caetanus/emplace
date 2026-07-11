@@ -458,6 +458,53 @@ struct Map(K, V, Allocator = Mallocator)
         return true;
     }
 
+    /// A consuming range over every entry with key <= `hi` (the `bisect_right`
+    /// prefix, ascending). Each entry is removed from the map as you advance past
+    /// it, so `foreach`, `.map`, `.each`, etc. drain and delete the prefix in one
+    /// pass. The value is live while it is `front`; `popFront` disposes it.
+    static struct RemoveRange
+    {
+        private Map* _map;
+        private K _hi;
+        private Node* _cur;
+
+        private this(Map* map, K hi) @nogc nothrow
+        {
+            _map = map;
+            _hi = hi;
+            seek();
+        }
+
+        private void seek() @nogc nothrow
+        {
+            _cur = _map.root is null ? null : minimum(_map.root);
+            if (_cur !is null && cmpKey(_cur.key, _hi) > 0)
+                _cur = null; // smallest key is past hi: range exhausted
+        }
+
+        @property bool empty() const @nogc nothrow
+        {
+            return _cur is null;
+        }
+
+        @property Entry front() @nogc nothrow
+        {
+            return Entry(_cur);
+        }
+
+        void popFront() @nogc nothrow @trusted
+        {
+            _map.remove(_cur.key); // dispose the entry we just yielded
+            seek(); // next smallest, still <= hi
+        }
+    }
+
+    /// Remove every entry with key <= `hi`; see `RemoveRange`.
+    RemoveRange removeRight(K hi) @nogc nothrow return
+    {
+        return RemoveRange(&this, hi);
+    }
+
     private static bool isBlack(Node* n) @nogc nothrow
     {
         return n is null || n.color == Color.black; // null leaves are black
@@ -932,6 +979,35 @@ struct OrderedSet(T, Allocator = Mallocator)
     foreach (i; 0 .. 200)
         m.set(i, i * 2); // served from the recycle pool, not fresh malloc
     assert(m.length == 200 && *m.get(150) == 300);
+}
+
+@nogc nothrow unittest // removeRight: consuming range drains the <= hi prefix in order
+{
+    Map!(int, int) m;
+    foreach (i; 0 .. 10)
+        m.set(i, i * 10);
+
+    int n = 0, sum = 0, lastKey = -1;
+    bool ordered = true;
+    foreach (e; m.removeRight(4)) // keys 0,1,2,3,4
+    {
+        if (e.key <= lastKey)
+            ordered = false;
+        lastKey = e.key;
+        sum += e.value;
+        n++;
+    }
+    assert(n == 5 && ordered && sum == 100); // 0+10+20+30+40
+    assert(m.length == 5); // 5..9 survive
+    foreach (i; 0 .. 5)
+        assert(m.get(i) is null);
+    foreach (i; 5 .. 10)
+        assert(*m.get(i) == i * 10);
+
+    foreach (e; m.removeRight(1000)) // past the max: drains everything
+    {
+    }
+    assert(m.empty);
 }
 
 @nogc nothrow unittest // OrderedSet: membership, in, dedup, ordered iteration
