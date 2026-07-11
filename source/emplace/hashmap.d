@@ -1,242 +1,492 @@
 module emplace.hashmap;
 
-// Unordered (hash) containers — the C++ std::unordered_map / unordered_set of
-// the set. Open addressing with linear probing and backward-shift deletion (no
-// tombstones), power-of-two capacity, grow at 0.75 load. Allocator-aware via
-// std.experimental.allocator (Mallocator default); @nogc when the allocator is.
-// Keys hash with druntime's hashOf and compare with ==.
+// Unordered (hash) container — a @nogc open-addressing hash table with malloc'd
+// string keys mapped to owned values. It is the proven table extracted from the
+// dreads database (battle-tested under a Redis/Valkey workload), generalized so
+// the value can be ANYTHING that owns a resource:
+//   * a type with `void free()` (the RAII-by-convention style), or
+//   * any type with a destructor — including this library's own `Uniq` / `Shared`
+//     / `Weak` smart pointers (a `HashMap!(Uniq!T)` frees each value's box on
+//     removal), or
+//   * plain data.
+// The table calls `.free()` if the value has it, else runs the destructor, on
+// overwrite / remove / clear / free. Values are moved in (so move-only values
+// like `Uniq` work). Keys are always `const(char)[]`.
+//
+// Instances are plain data (no destructor, no copy hooks) so they can live
+// inside a union — call `free()` explicitly when done.
 
-import std.experimental.allocator : makeArray, dispose;
-import std.experimental.allocator.mallocator : Mallocator;
+import core.lifetime : moveEmplace;
+import core.stdc.stdlib : calloc, malloc, cfree = free;
+import core.stdc.string : memcpy;
+import std.traits : hasElaborateDestructor;
 
-private enum ubyte SLOT_EMPTY = 0;
-private enum ubyte SLOT_USED = 1;
-
-/// std::unordered_map. Move-only (owns a malloc'd table).
-struct HashMap(K, V, Allocator = Mallocator)
+private const(char)[] mallocDup(scope const(char)[] s) @nogc nothrow @trusted
 {
-    private struct Slot
+    if (s.length == 0)
+        return "";
+    auto p = cast(char*) malloc(s.length);
+    assert(p !is null, "out of memory");
+    memcpy(p, s.ptr, s.length);
+    return p[0 .. s.length];
+}
+
+private void freeSlice(scope const(char)[] s) @nogc nothrow @trusted
+{
+    if (s.length)
+        cfree(cast(void*) s.ptr);
+}
+
+private ulong fnv1a(scope const(char)[] s) @nogc nothrow
+{
+    ulong h = 0xcbf2_9ce4_8422_2325;
+    foreach (c; s)
     {
-        K key;
+        h ^= c;
+        h *= 0x100_0000_01b3;
+    }
+    return h;
+}
+
+private enum SlotState : ubyte
+{
+    empty,
+    used,
+    tomb
+}
+
+struct HashMap(V)
+{
+    private static struct Slot
+    {
+        SlotState state;
+        ulong hash;
+        const(char)[] key;
         V val;
-        ubyte state; // SLOT_EMPTY / SLOT_USED
     }
 
-    private Slot[] slots;
-    private size_t count;
+    private Slot* slots;
+    private size_t cap; // power of two; 0 until first insert
+    private size_t used;
+    private size_t fill; // live + tombstones
 
-    @disable this(this);
-
-    ~this() @trusted
+    // Run a value's resource release: `.free()` by convention if present, else
+    // its destructor (covers Uniq/Shared/Weak and any RAII type; a no-op for POD).
+    private static void disposeVal(ref V v)
     {
-        if (slots.length)
-            Allocator.instance.dispose(slots);
+        static if (__traits(compiles, v.free()))
+            v.free();
+        else static if (hasElaborateDestructor!V)
+            destroy!false(v); // runs Uniq/Shared/Weak (and any RAII) dtor
+        // else: plain data, nothing to release
     }
 
     @property size_t length() const
     {
-        return count;
+        return used;
     }
 
     @property bool empty() const
     {
-        return count == 0;
+        return used == 0;
     }
 
-    private size_t slotFor(const ref K key) const @trusted
+    /// Releases every entry and the table itself.
+    void free()
     {
-        immutable mask = slots.length - 1;
-        size_t i = hashOf(key) & mask;
-        while (slots[i].state == SLOT_USED && slots[i].key != key)
-            i = (i + 1) & mask;
-        return i;
-    }
-
-    private void grow() @trusted
-    {
-        immutable newCap = slots.length ? slots.length * 2 : 8;
-        auto old = slots;
-        slots = Allocator.instance.makeArray!Slot(newCap); // states start EMPTY (0)
-        count = 0;
-        foreach (ref s; old)
-            if (s.state == SLOT_USED)
-                set(s.key, s.val);
-        if (old.length)
-            Allocator.instance.dispose(old);
-    }
-
-    /// Insert or overwrite.
-    void set(K key, V val) @trusted
-    {
-        if ((count + 1) * 4 >= slots.length * 3) // load factor 0.75
-            grow();
-        immutable i = slotFor(key);
-        if (slots[i].state != SLOT_USED)
+        clear();
+        if (slots !is null)
         {
-            slots[i].state = SLOT_USED;
-            slots[i].key = key;
-            count++;
+            cfree(slots);
+            slots = null;
+            cap = 0;
         }
-        slots[i].val = val;
     }
 
-    /// Pointer to the stored value, or null.
-    V* get(K key) @trusted return
+    /// Removes every entry, keeping the allocated table.
+    void clear()
     {
-        if (count == 0)
-            return null;
-        immutable i = slotFor(key);
-        return slots[i].state == SLOT_USED ? &slots[i].val : null;
+        foreach (i; 0 .. cap)
+        {
+            if (slots[i].state == SlotState.used)
+            {
+                freeSlice(slots[i].key);
+                disposeVal(slots[i].val);
+            }
+            slots[i] = Slot.init;
+        }
+        used = fill = 0;
     }
 
-    bool contains(K key) @trusted
+    private size_t findSlot(scope const(char)[] k, ulong h, out bool found) const
     {
-        return get(key) !is null;
-    }
-
-    /// Remove; returns true if present. Backward-shift keeps the probe chains
-    /// intact without tombstones.
-    bool remove(K key) @trusted
-    {
-        if (count == 0)
-            return false;
-        immutable mask = slots.length - 1;
-        size_t i = slotFor(key);
-        if (slots[i].state != SLOT_USED)
-            return false;
-        size_t j = i;
+        size_t mask = cap - 1;
+        size_t i = h & mask;
+        size_t firstTomb = size_t.max;
         while (true)
         {
-            j = (j + 1) & mask;
-            if (slots[j].state != SLOT_USED)
-                break;
-            immutable home = hashOf(slots[j].key) & mask;
-            // if slot j's ideal home is "not after" i (in circular order), shift it back
-            immutable canMove = (i <= j) ? (home <= i || home > j) : (home <= i && home > j);
-            if (canMove)
+            final switch (slots[i].state)
             {
-                slots[i] = slots[j];
-                i = j;
+            case SlotState.empty:
+                found = false;
+                return firstTomb != size_t.max ? firstTomb : i;
+            case SlotState.tomb:
+                if (firstTomb == size_t.max)
+                    firstTomb = i;
+                break;
+            case SlotState.used:
+                if (slots[i].hash == h && slots[i].key == k)
+                {
+                    found = true;
+                    return i;
+                }
+                break;
             }
+            i = (i + 1) & mask;
         }
-        slots[i].state = SLOT_EMPTY;
-        slots[i] = Slot.init;
-        count--;
+    }
+
+    private void rehash(size_t ncap) @trusted
+    {
+        auto nslots = cast(Slot*) calloc(ncap, Slot.sizeof);
+        assert(nslots !is null, "out of memory");
+        size_t mask = ncap - 1;
+        foreach (i; 0 .. cap)
+        {
+            if (slots[i].state != SlotState.used)
+                continue;
+            size_t j = slots[i].hash & mask;
+            while (nslots[j].state == SlotState.used)
+                j = (j + 1) & mask;
+            moveEmplace(slots[i], nslots[j]); // move the whole slot (works for move-only values)
+        }
+        if (slots !is null)
+            cfree(slots);
+        slots = nslots;
+        cap = ncap;
+        fill = used;
+    }
+
+    private void maybeGrow()
+    {
+        if (fill * 4 < cap * 3)
+            return;
+        size_t ncap = cap == 0 ? 16 : (used * 2 >= cap ? cap * 2 : cap);
+        rehash(ncap);
+    }
+
+    /// Insert or overwrite, taking ownership of `val` (moved in — move-only
+    /// values like Uniq work). Returns true if the key was new.
+    bool set(scope const(char)[] k, V val)
+    {
+        maybeGrow();
+        auto h = fnv1a(k);
+        bool found;
+        auto i = findSlot(k, h, found);
+        if (found)
+        {
+            disposeVal(slots[i].val);
+            moveEmplace(val, slots[i].val);
+            return false;
+        }
+        if (slots[i].state == SlotState.empty)
+            fill++;
+        slots[i].state = SlotState.used;
+        slots[i].hash = h;
+        slots[i].key = mallocDup(k);
+        moveEmplace(val, slots[i].val);
+        used++;
         return true;
     }
 
-    void clear() @trusted
+    /// Pointer to the live value, or null. Valid until the next set/del.
+    inout(V)* get(scope const(char)[] k) inout
     {
-        foreach (ref s; slots)
-            s = Slot.init;
-        count = 0;
+        if (used == 0)
+            return null;
+        bool found;
+        auto i = findSlot(k, fnv1a(k), found);
+        return found ? &slots[i].val : null;
     }
 
-    /// Iterate key/value pairs (unspecified order).
-    int opApply(scope int delegate(ref K, ref V) dg)
+    bool contains(scope const(char)[] k) const
     {
-        foreach (ref s; slots)
-            if (s.state == SLOT_USED)
-                if (auto r = dg(s.key, s.val))
-                    return r;
+        return get(k) !is null;
+    }
+
+    alias exists = contains;
+
+    bool remove(scope const(char)[] k)
+    {
+        if (used == 0)
+            return false;
+        bool found;
+        auto i = findSlot(k, fnv1a(k), found);
+        if (!found)
+            return false;
+        freeSlice(slots[i].key);
+        disposeVal(slots[i].val);
+        slots[i] = Slot.init;
+        slots[i].state = SlotState.tomb;
+        used--;
+        return true;
+    }
+
+    alias del = remove;
+
+    /// Remove `k` without releasing its value; the caller takes ownership.
+    bool steal(scope const(char)[] k, out V val)
+    {
+        if (used == 0)
+            return false;
+        bool found;
+        auto i = findSlot(k, fnv1a(k), found);
+        if (!found)
+            return false;
+        freeSlice(slots[i].key);
+        moveEmplace(slots[i].val, val);
+        slots[i] = Slot.init;
+        slots[i].state = SlotState.tomb;
+        used--;
+        return true;
+    }
+
+    // Index-based iteration for @nogc callers that cannot afford closures.
+    @property size_t capacity() const
+    {
+        return cap;
+    }
+
+    bool slotLive(size_t i) const
+    {
+        return slots[i].state == SlotState.used;
+    }
+
+    const(char)[] keyAt(size_t i) const
+    {
+        return slots[i].key;
+    }
+
+    inout(V)* valAt(size_t i) inout
+    {
+        return &slots[i].val;
+    }
+
+    int opApply(scope int delegate(const(char)[] key, ref V val) @nogc nothrow dg) @nogc nothrow
+    {
+        foreach (i; 0 .. cap)
+        {
+            if (slots[i].state != SlotState.used)
+                continue;
+            if (auto r = dg(slots[i].key, slots[i].val))
+                return r;
+        }
         return 0;
     }
 }
 
-/// std::unordered_set — a HashMap with no value.
-struct HashSet(K, Allocator = Mallocator)
+/// std::unordered_set — string keys, no value.
+struct HashSet
 {
     private struct Unit
     {
     }
 
-    private HashMap!(K, Unit, Allocator) tbl;
+    private HashMap!Unit tbl;
 
-    @disable this(this);
-
-    void add(K key)
+    // HashSet is a concrete (non-template) struct, so its methods do not infer
+    // attributes the way HashMap's do — annotate them explicitly.
+    void add(scope const(char)[] k) @nogc nothrow
     {
-        tbl.set(key, Unit.init);
+        tbl.set(k, Unit.init);
     }
 
-    bool remove(K key)
+    bool remove(scope const(char)[] k) @nogc nothrow
     {
-        return tbl.remove(key);
+        return tbl.remove(k);
     }
 
-    bool contains(K key)
+    bool contains(scope const(char)[] k) const @nogc nothrow
     {
-        return tbl.contains(key);
+        return tbl.contains(k);
     }
 
-    bool opBinaryRight(string op : "in")(K key)
+    bool opBinaryRight(string op : "in")(scope const(char)[] k) const @nogc nothrow
     {
-        return contains(key);
+        return contains(k);
     }
 
-    @property size_t length() const
+    @property size_t length() const @nogc nothrow
     {
         return tbl.length;
     }
 
-    @property bool empty() const
+    void free() @nogc nothrow
     {
-        return tbl.empty;
+        tbl.free();
     }
 
-    void clear()
+    int opApply(scope int delegate(const(char)[]) @nogc nothrow dg) @nogc nothrow
     {
-        tbl.clear();
-    }
-
-    int opApply(scope int delegate(ref K) dg)
-    {
-        return tbl.opApply((ref K k, ref Unit _) => dg(k));
+        return tbl.opApply((const(char)[] k, ref Unit _) => dg(k));
     }
 }
 
-unittest // HashMap: insert/overwrite/lookup/remove
-{
-    HashMap!(string, int) m;
-    m.set("a", 1);
-    m.set("b", 2);
-    m.set("a", 10); // overwrite
-    assert(m.length == 2);
-    assert(*m.get("a") == 10 && *m.get("b") == 2);
-    assert(m.get("z") is null && m.contains("a") && !m.contains("z"));
-    assert(m.remove("a") && !m.contains("a") && m.length == 1);
-    assert(!m.remove("a"));
+@nogc nothrow unittest // PROOF: containers compose "downhill" — a HashMap of a
+{ //  Map of a Vector, freed in one cascade (HashMap -> Map dtor -> Vector dtor)
+    import emplace.map : Map;
+    import emplace.vector : Vector;
+    import core.lifetime : move;
+
+    HashMap!(Map!(const(char)[], Vector!int)) outer;
+    scope (exit)
+        outer.free();
+
+    Map!(const(char)[], Vector!int) inner;
+    Vector!int v;
+    v.put(1);
+    v.put(2);
+    v.put(3);
+    inner.set("nums", move(v)); // Map owns a Vector
+    outer.set("k", move(inner)); // HashMap owns the Map owns the Vector
+
+    // read down all three levels
+    auto m = outer.get("k");
+    assert(m !is null);
+    auto vec = m.get("nums");
+    assert(vec !is null && (*vec)[].length == 3 && (*vec)[0] == 1 && (*vec)[2] == 3);
+    // outer.free() (scope exit) releases the whole tree in one cascade.
 }
 
-unittest // grows and stays correct across many keys, then removals
+version (unittest) private struct Owned // a `.free()`-convention value
 {
-    HashMap!(int, int) m;
-    foreach (i; 0 .. 1000)
-        m.set(i, i * i);
-    assert(m.length == 1000);
-    foreach (i; 0 .. 1000)
-        assert(*m.get(i) == i * i);
-    foreach (i; 0 .. 1000)
-        if (i % 3 == 0)
-            assert(m.remove(i));
-    foreach (i; 0 .. 1000)
-        assert((m.get(i) is null) == (i % 3 == 0));
-
-    int seen = 0;
-    foreach (ref k, ref v; m)
+    __gshared int live;
+    char* p;
+    static Owned of(int tag) @nogc nothrow
     {
-        assert(v == k * k);
-        seen++;
+        Owned o;
+        o.p = cast(char*) malloc(1);
+        *o.p = cast(char) tag;
+        live++;
+        return o;
     }
-    assert(seen == m.length);
+
+    void free() @nogc nothrow
+    {
+        if (p)
+        {
+            cfree(p);
+            p = null;
+            live--;
+        }
+    }
 }
 
-unittest // HashSet
+@nogc nothrow unittest // .free()-convention values: set/overwrite/del/clear/free
 {
-    HashSet!string s;
-    s.add("x");
-    s.add("y");
-    s.add("x"); // dedup
-    assert(s.length == 2 && "x" in s && !("z" in s));
-    assert(s.remove("x") && !("x" in s));
+    Owned.live = 0;
+    HashMap!Owned m;
+    assert(m.set("a", Owned.of(1)) && !m.set("a", Owned.of(2))); // overwrite frees old
+    assert(m.length == 1 && Owned.live == 1);
+    m.set("b", Owned.of(3));
+    assert(m.remove("a") && Owned.live == 1); // "b" still live
+    m.free();
+    assert(Owned.live == 0); // everything released
+}
+
+@nogc nothrow unittest // PROOF: HashMap owns unique_ptr / shared_ptr / weak_ptr
+{
+    import emplace.smartptr : Uniq, Shared, Weak;
+
+    static struct C
+    {
+        __gshared int live;
+        int v;
+        this(int x) @nogc nothrow
+        {
+            v = x;
+            live++;
+        }
+
+        ~this() @nogc nothrow
+        {
+            live--;
+        }
+    }
+
+    // --- unique_ptr values (move-only; moved into the table, dtor frees) ---
+    C.live = 0;
+    {
+        HashMap!(Uniq!C) m;
+        scope (exit)
+            m.free();
+        m.set("x", Uniq!C.make(1));
+        m.set("y", Uniq!C.make(2));
+        assert(m.length == 2 && C.live == 2);
+        assert(m.get("x").get.v == 1); // borrow through the table
+        assert(m.remove("x") && C.live == 1); // removal runs the Uniq dtor
+        // steal: move ownership back out, no free
+        Uniq!C out_;
+        assert(m.steal("y", out_) && out_.get.v == 2 && C.live == 1);
+        assert(m.length == 0);
+    } // out_ dies here
+    assert(C.live == 0);
+
+    // --- shared_ptr values (refcounted) ---
+    C.live = 0;
+    {
+        HashMap!(Shared!C) m;
+        scope (exit)
+            m.free();
+        auto sp = Shared!C.make(7);
+        m.set("s", sp); // table holds a second strong ref
+        assert(sp.useCount == 2 && C.live == 1);
+        assert(m.get("s").get.v == 7);
+        m.remove("s"); // table's ref dropped
+        assert(sp.useCount == 1 && C.live == 1);
+    }
+    assert(C.live == 0);
+
+    // --- weak_ptr values (non-owning observers) ---
+    C.live = 0;
+    {
+        auto sp = Shared!C.make(9);
+        HashMap!(Weak!C) m;
+        scope (exit)
+            m.free();
+        m.set("w", sp.weaken());
+        assert(!m.get("w").expired && C.live == 1);
+        // the object stays alive because `sp` still owns it, not the weak table
+        assert(m.get("w").lock().get.v == 9);
+    }
+    assert(C.live == 0);
+}
+
+@nogc unittest // rehash under load + HashSet
+{
+    HashMap!int m;
+    scope (exit)
+        m.free();
+    foreach (i; 0 .. 1000)
+        m.set(itoa(i), i);
+    assert(m.length == 1000 && *m.get(itoa(999)) == 999);
+    foreach (i; 0 .. 500)
+        assert(m.remove(itoa(i)));
+    assert(m.length == 500 && !m.contains(itoa(42)) && m.contains(itoa(542)));
+
+    HashSet s;
+    scope (exit)
+        s.free();
+    s.add("a");
+    s.add("a");
+    assert(s.length == 1 && "a" in s && !("b" in s));
+}
+
+version (unittest) private const(char)[] itoa(int i) @nogc nothrow
+{
+    import core.stdc.stdio : snprintf;
+
+    static char[16] buf;
+    immutable n = snprintf(buf.ptr, buf.length, "%d", i);
+    return buf[0 .. n];
 }
