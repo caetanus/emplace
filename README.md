@@ -34,15 +34,29 @@ import emplace.map : Map, OrderedSet;
 
 ### Containers
 - **`emplace.vector.Vector!(T, Alloc = Mallocator)`** — a dynamic array; bulk
-  `put(slice)` is a single `memcpy` (not a per-element loop), copyable for POD.
+  `put(slice)` is a single `memcpy` (not a per-element loop). `shrinkToFit`
+  (`shrink_to_fit`). **`Vector!bool` is bit-packed** (`std::vector<bool>`): one
+  bit per element, `opIndex` returns an assignable proxy bit-reference.
+- **`emplace.deque.Deque!(T, Alloc = Mallocator)`** — a double-ended queue: a
+  circular buffer over one contiguous block, O(1) push/pop at both ends and O(1)
+  random access. **Releases memory as it drains** (halves capacity at ¼ load,
+  frees at empty) — safe for long-running FIFOs.
 - **`emplace.map.Map!(K, V)`** — an ordered map on a hand-rolled red-black tree
   (O(log n) insert/lookup/remove, sorted iteration, `leftBound`/`rightBound`
-  floor/ceiling + `foreachRange`).
+  floor/ceiling + `foreachRange`, `removeRight` consuming prefix range).
 - **`emplace.map.OrderedSet!T`** — the ordered set: the valueless companion
   (union / intersection / difference / symmetric difference, subset / superset).
 - **`emplace.hashmap.HashMap!(K, V)`** — `unordered_map`: open-addressed hash
   table, linear probing with backward-shift deletion (no tombstones).
 - **`emplace.hashmap.HashSet!K`** — `unordered_set`.
+
+Every container is **RAII and smart-pointer safe**: elements are *moved* into
+place, and `popBack`/`clear`/`~this` release each one (its `.free()` or
+destructor), so a `Vector!(Uniq!T)` or `Deque!(Shared!T)` never leaks. Each is
+**copyable exactly when its element is** (a deep, independent copy — `Map` deep-
+clones its tree like `std::map`); an element with a move-only type (e.g. `Uniq`)
+makes the whole container move-only, so a bitwise copy can never double-free.
+All expose D **ranges** (`opSlice`).
 
 ## Allocators
 

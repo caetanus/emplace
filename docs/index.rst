@@ -60,20 +60,39 @@ Containers
 
 ``Vector!(T, Alloc)`` (``emplace.vector``)
    A dynamic array. Bulk ``put(slice)`` is a single ``memcpy`` (not a per-element
-   loop); copyable for POD element types.
+   loop).
 
    API: ``put(x)`` / ``put(slice)``, ``popBack``, ``clear`` (keeps capacity),
-   ``length`` (get/set), ``reserve``, ``opSlice`` (``v[]``), ``opIndex``.
+   ``length`` (get/set), ``reserve``, ``shrinkToFit`` (``shrink_to_fit`` — gives
+   excess capacity back), ``opSlice`` (``v[]``), ``opIndex``.
+
+   ``Vector!bool`` is a **bit-packed specialization** (like ``std::vector<bool>``):
+   one bit per element in a ``size_t`` word array, and ``opIndex`` returns an
+   assignable, bool-convertible proxy bit-reference.
+
+``Deque!(T, Alloc)`` (``emplace.deque``)
+   A double-ended queue: a circular buffer over one contiguous grow-by-doubling
+   block (power-of-two capacity + mask). O(1) ``pushFront`` / ``pushBack`` /
+   ``popFront`` / ``popBack`` and O(1) ``opIndex`` random access.
+
+   **Releases memory as it drains** (halves capacity once load drops to ¼, with
+   hysteresis; frees the block entirely at empty), so a long-running queue never
+   grows without bound. API: ``pushFront`` / ``pushBack`` / ``popFront`` /
+   ``popBack``, ``front`` / ``back`` / ``opIndex``, ``length`` / ``empty`` /
+   ``clear``, ``opSlice`` (forward range).
 
 ``Map!(K, V)`` (``emplace.map``)
    An ordered map on a hand-rolled red-black tree: O(log n) ``set`` / ``get`` /
-   ``remove``, in-order (sorted) iteration.
+   ``remove``, in-order (sorted) iteration. Copyable (deep clone of the tree,
+   like ``std::map``) when both key and value are.
 
    Bound queries (no second index, one descent):
 
    * ``leftBound(key)`` — ceiling, the smallest key ``>= key``.
    * ``rightBound(key)`` — floor, the largest key ``<= key``.
+   * ``upperBound(key)`` — strict ceiling (``bisect_right`` / ``upper_bound``).
    * ``foreachRange(lo, hi, dg)`` — O(log n + hits) range scan.
+   * ``removeRight(hi)`` — a consuming range that drains the ``<= hi`` prefix.
 
 ``OrderedSet!T`` (``emplace.map``)
    The ordered set — the valueless companion: ``add`` / ``remove`` / ``in``, and
@@ -87,6 +106,16 @@ Containers
 
 ``HashSet!K`` (``emplace.hashmap``)
    ``unordered_set`` — ``add`` / ``remove`` / ``in`` / ``opApply``.
+
+RAII and smart-pointer safety
+-----------------------------
+
+Every container moves elements into place and releases each one on
+``popBack`` / ``clear`` / ``~this`` (its ``.free()`` by convention, else its
+destructor), so a ``Vector!(Uniq!T)`` or ``Deque!(Shared!T)`` never leaks. Each
+container is copyable exactly when its element is — a deep, independent copy;
+an element with a move-only type (e.g. ``Uniq``) makes the whole container
+move-only, so a bitwise copy can never double-free.
 
 Allocators
 ----------

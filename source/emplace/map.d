@@ -9,8 +9,10 @@ module emplace.map;
 // third template argument) and freed/recycled explicitly.
 //
 // Keys compare with `cmpKey` (byte-lexicographic for const(char)[]). Both
-// containers are move-only (`@disable this(this)`): they own a raw node graph,
-// so a bitwise copy would double-free. Pass by `ref`, or `dup()` explicitly.
+// containers are copyable exactly when their key/value is (a deep clone of the
+// node graph — structure and colors preserved, own recycle pool), matching
+// std::map/std::set; a move-only key/value (e.g. `Uniq`) makes them move-only,
+// so a bitwise copy can never double-free the raw node graph.
 
 import std.experimental.allocator : make, dispose;
 import std.experimental.allocator.mallocator : Mallocator;
@@ -53,7 +55,42 @@ struct Map(K, V, Allocator = Mallocator)
     private size_t count;
     private Node* freePool; // recycled node memory (singly linked via .parent)
 
-    @disable this(this); // move-only: owns a raw node graph
+    // Copyable when both key and value are copyable — a deep clone of the node
+    // graph (structure + colors preserved; the copy does NOT share the source's
+    // recycle pool). A move-only key/value (e.g. `Uniq`) makes the map move-only.
+    static if (__traits(compiles, { K k = K.init; auto kc = k; V v = V.init; auto vc = v; }))
+    {
+        this(this) @trusted
+        {
+            auto srcRoot = root; // fields were bit-copied from the source
+            root = cloneSubtree(srcRoot, null);
+            freePool = null; // a fresh map's own recycle pool
+            // `count` is already the source's count (correct for the copy)
+        }
+
+        // Deep-clone a subtree, copy-constructing each key/value and preserving
+        // the red-black structure + colors (source is valid ⇒ the clone is).
+        // Lives inside the copyable branch so a move-only key/value never
+        // instantiates the (impossible) element copy.
+        private static Node* cloneSubtree(Node* s, Node* parent) @trusted
+        {
+            if (s is null)
+                return null;
+            import core.lifetime : emplace;
+
+            auto n = cast(Node*) Allocator.instance.allocate(Node.sizeof).ptr;
+            assert(n !is null, "out of memory");
+            emplace(&n.key, s.key); // copy ctor / postblit
+            emplace(&n.val, s.val);
+            n.color = s.color;
+            n.parent = parent;
+            n.left = cloneSubtree(s.left, n);
+            n.right = cloneSubtree(s.right, n);
+            return n;
+        }
+    }
+    else
+        @disable this(this); // move-only key/value ⇒ move-only map
 
     ~this() @nogc nothrow
     {
@@ -711,7 +748,8 @@ struct OrderedSet(T, Allocator = Mallocator)
 
     private Map!(T, Unit, Allocator) tree;
 
-    @disable this(this); // move-only (owns the tree)
+    // Copyability follows the underlying tree: copyable when `T` is (deep clone),
+    // move-only when `T` is (the compiler-generated copy hook forwards to `tree`).
 
     void add(T item) @nogc nothrow
     {
@@ -1052,3 +1090,22 @@ struct OrderedSet(T, Allocator = Mallocator)
     assert(sub.isSubsetOf(a) && a.isSupersetOf(sub));
     assert(!a.isSubsetOf(sub));
 }
+
+@nogc nothrow unittest // Map is copyable (deep clone, like std::map) — independent
+{
+    Map!(int, int) a;
+    foreach (i; 0 .. 20)
+        a.set(i, i * 10);
+    auto b = a; // this(this): deep clone of the tree
+    assert(b.length == 20);
+    b.set(5, 999); // mutating the copy must not touch the original
+    assert(*a.get(5) == 50 && *b.get(5) == 999);
+    a.remove(7); // and vice versa
+    assert(a.get(7) is null && *b.get(7) == 70);
+    // both iterate their own full contents in order
+    int n;
+    foreach (k, v; b)
+        n++;
+    assert(n == 20);
+}
+
