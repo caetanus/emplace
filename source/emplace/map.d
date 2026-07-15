@@ -729,6 +729,15 @@ struct Map(K, V, Allocator = Mallocator)
         }
     }
 
+    /// Reset AND reclaim. For this node-based tree there is no contiguous backing
+    /// to keep, so `clear()` already returns every node (and the recycle pool) to
+    /// the allocator — `clearShrink()` is provided for API parity with the other
+    /// containers and coincides with `clear()`.
+    void clearShrink() @nogc nothrow @trusted
+    {
+        clear();
+    }
+
     private static void freeSubtree(Node* n) @nogc nothrow @trusted
     {
         if (n is null)
@@ -784,6 +793,12 @@ struct OrderedSet(T, Allocator = Mallocator)
     void clear() @nogc nothrow
     {
         tree.clear();
+    }
+
+    /// Reset AND reclaim (see Map.clearShrink; coincides with clear() here).
+    void clearShrink() @nogc nothrow
+    {
+        tree.clearShrink();
     }
 
     /// Iterate members in ascending order.

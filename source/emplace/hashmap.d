@@ -152,6 +152,17 @@ struct HashMap(V)
         used = fill = 0;
     }
 
+    /// Reset AND reclaim: like `clear()` but also gives the table memory back to
+    /// the allocator (std::unordered_map has no such call, but a reused-then-idle
+    /// buffer wants it). Distinct from `free()` in intent only — `free()` reads as
+    /// end-of-life (RAII teardown), `clearShrink()` as "empty it, release the
+    /// capacity, I may fill it again". The container stays usable; the next insert
+    /// re-allocates. Use it after a one-off spike; use `clear()` for steady reuse.
+    void clearShrink()
+    {
+        free();
+    }
+
     private size_t findSlot(scope const(char)[] k, ulong h, out bool found) const
     {
         size_t mask = cap - 1;
@@ -439,6 +450,28 @@ version (unittest) private struct Owned // a `.free()`-convention value
     assert(m.remove("a") && Owned.live == 1); // "b" still live
     m.free();
     assert(Owned.live == 0); // everything released
+}
+
+@nogc nothrow unittest // clear keeps capacity; clearShrink reclaims; both stay reusable
+{
+    Owned.live = 0;
+    HashMap!Owned m;
+    foreach (i; 0 .. 50)
+        m.set(itoa(i), Owned.of(i));
+    assert(m.length == 50 && Owned.live == 50);
+
+    m.clear(); // reset, KEEP the table
+    assert(m.length == 0 && Owned.live == 0); // every value released...
+    assert(m.capacity > 0); // ...but capacity retained for reuse
+    m.set("x", Owned.of(1)); // still usable after clear
+    assert(m.length == 1 && Owned.live == 1);
+
+    m.clearShrink(); // reset AND give the table memory back
+    assert(m.length == 0 && Owned.live == 0 && m.capacity == 0);
+    m.set("y", Owned.of(2)); // re-allocates on demand, still usable
+    assert(m.length == 1 && *m.get("y").p == 2);
+    m.free();
+    assert(Owned.live == 0);
 }
 
 @nogc nothrow unittest // PROOF: HashMap owns unique_ptr / shared_ptr / weak_ptr

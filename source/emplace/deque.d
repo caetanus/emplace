@@ -258,6 +258,20 @@ struct Deque(T, Allocator = Mallocator)
         _head = 0;
     }
 
+    /// Reset AND reclaim: like clear(), but also returns the ring buffer to the
+    /// allocator. Stays usable — the next push re-allocates. Distinct from `~this`
+    /// in intent: release a reused deque's memory, not end its life.
+    void clearShrink() @trusted
+    {
+        clear();
+        if (_ptr !is null)
+        {
+            Allocator.instance.deallocate((cast(void*) _ptr)[0 .. _cap * T.sizeof]);
+            _ptr = null;
+            _cap = _head = 0;
+        }
+    }
+
     size_t opDollar() const @nogc nothrow
     {
         return _len;

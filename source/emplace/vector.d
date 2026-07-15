@@ -153,6 +153,14 @@ struct Vector(T, Allocator = Mallocator)
             _len = 0;
         }
 
+        /// Reset AND reclaim: clear() then return the word block to the allocator.
+        /// Stays usable (next `put` re-allocates). See the general Vector overload.
+        void clearShrink() @trusted
+        {
+            clear();
+            shrinkToFit();
+        }
+
         void reserve(size_t n) @trusted
         {
             ensure(n);
@@ -442,6 +450,16 @@ struct Vector(T, Allocator = Mallocator)
                 foreach (i; 0 .. _len)
                     disposeElem(_ptr[i]);
             _len = 0;
+        }
+
+        /// Reset AND reclaim: clear() then hand the buffer back to the allocator
+        /// (shrinkToFit on an empty vector frees it). The vector stays usable — the
+        /// next append re-allocates. Distinct from `~this` in intent: use this to
+        /// release a reused buffer's memory, `clear()` for steady reuse.
+        void clearShrink() @trusted
+        {
+            clear();
+            shrinkToFit();
         }
 
         void reserve(size_t n) @trusted
