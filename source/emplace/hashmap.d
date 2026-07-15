@@ -55,6 +55,17 @@ private enum SlotState : ubyte
     tomb
 }
 
+// STL-consistent (std::unordered_map): a real destructor frees the table and
+// cascades to each value, and a copy is an independent deep clone — so the map
+// composes with the smart pointers (a `Shared!X`/`Uniq!X` holding a `HashMap`
+// cleans up with no leak and no manual `.free()`), exactly like its sibling
+// `Vector`/`Map`/`Deque`.
+//
+// It is SAFE as a by-value UNION member (e.g. RObj's `union { SmallHash; SmallSet;
+// ... }`): D never auto-runs a union member's destructor (it can't know which
+// member is active), so the union's owner keeps freeing by tag and there is no
+// double-free — no dtorless variant is needed. The `union member dtor` unittest
+// at the bottom pins that language guarantee.
 struct HashMap(V)
 {
     private static struct Slot
@@ -69,6 +80,29 @@ struct HashMap(V)
     private size_t cap; // power of two; 0 until first insert
     private size_t used;
     private size_t fill; // live + tombstones
+
+    /// RAII: destruction releases the table and every value. Idempotent (free()
+    /// nulls the table, so a redundant free/dtor is a no-op).
+    ~this()
+    {
+        free();
+    }
+
+    static if (__traits(isCopyable, V))
+        /// Value semantics: a copy is an independent deep clone (own key bytes,
+        /// each value copied) — never a shared bitwise alias that double-frees.
+        this(this) @trusted
+        {
+            auto src = slots;
+            immutable scap = cap;
+            slots = null;
+            cap = used = fill = 0;
+            foreach (i; 0 .. scap)
+                if (src[i].state == SlotState.used)
+                    set(src[i].key, src[i].val); // dups the key, copies the value
+        }
+    else
+        @disable this(this); // move-only value ⇒ move-only map (like Vector)
 
     // Run a value's resource release: `.free()` by convention if present, else
     // its destructor (covers Uniq/Shared/Weak and any RAII type; a no-op for POD).
@@ -493,6 +527,72 @@ version (unittest) private struct Owned // a `.free()`-convention value
     s.add("a");
     s.add("a");
     assert(s.length == 1 && "a" in s && !("b" in s));
+}
+
+// PROOF that a HashMap (which now has `~this`) is safe as a by-value UNION member
+// — the pattern RObj uses (`union { SmallHash; SmallSet; ... }`). D never
+// auto-runs a union member's destructor (it can't know which member is active),
+// so the union's owner frees by tag with no double-free and no leak.
+@nogc nothrow unittest
+{
+    // (a) the language guarantee itself: a union member's ~this is NOT auto-called.
+    static int ticks;
+    static struct Ticker
+    {
+        ~this() @nogc nothrow { ticks++; }
+    }
+
+    static struct HolderA
+    {
+        union
+        {
+            Ticker t;
+            int i;
+        }
+    }
+
+    ticks = 0;
+    {
+        HolderA h;
+        h.i = 7;
+    } // scope exit: HolderA.~this does NOT run the union member Ticker's dtor
+    assert(ticks == 0);
+
+    // (b) a HashMap-in-union, freed BY TAG, releases each value exactly once —
+    // no leak, no double-free.
+    static int vfrees;
+    static struct Val
+    {
+        void free() @nogc nothrow { vfrees++; }
+    }
+
+    static struct Tagged
+    {
+        ubyte tag; // 0 = `a` is the active member
+        union
+        {
+            HashMap!Val a;
+            HashMap!Val b;
+        }
+
+        void free() @nogc nothrow @trusted
+        {
+            if (tag == 0)
+                a.free();
+            else
+                b.free();
+        }
+    }
+
+    vfrees = 0;
+    {
+        Tagged tg;
+        tg.tag = 0;
+        tg.a.set("x", Val());
+        tg.a.set("y", Val());
+        tg.free(); // frees a's two values by tag
+    } // scope exit: a.~this is NOT auto-run (union member)
+    assert(vfrees == 2); // each value freed exactly once
 }
 
 version (unittest) private const(char)[] itoa(int i) @nogc nothrow
