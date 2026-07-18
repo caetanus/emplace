@@ -743,6 +743,375 @@ struct Map(K, V, Allocator = Mallocator)
             x.color = Color.black;
     }
 
+    // ---- split: detach the `<= hi` prefix as its OWN valid RB-tree in O(log n),
+    // leaving `> hi` as this map's tree. The point (per the active-expire design):
+    // a big due-prefix is detached with ONE O(log n) split instead of O(K) removes,
+    // and the detached side is torn down off the event loop (its per-key unlink +
+    // notify + RObj free). Built on the "Just Join for Parallel Ordered Sets" RB
+    // join, adapted to mutate in place and keep parent pointers coherent.
+    //
+    // Black-height (textbook bh): number of black nodes on any path from, but NOT
+    // including, `t` down to a leaf, counting the terminal black null leaf. Null-safe:
+    // bh(null)==0, bh(any single leaf, red or black)==1. All paths in a valid RB tree
+    // have the same count, so the left spine is representative.
+    private static int bh(Node* t) @nogc nothrow
+    {
+        if (t is null)
+            return 0;
+        int h = 0;
+        for (auto n = t.left;; n = n.left)
+        {
+            if (n is null)
+            {
+                ++h; // the black null leaf terminating the path
+                break;
+            }
+            if (n.color == Color.black)
+                ++h;
+        }
+        return h;
+    }
+
+    // Root-ref rotations: CLRS rotateLeft/Right but updating a PASSED-IN root
+    // (join/split build DETACHED subtrees, so they must not touch the map's `root`).
+    private static void rotLRoot(ref Node* root, Node* x) @nogc nothrow
+    {
+        auto y = x.right;
+        x.right = y.left;
+        if (y.left !is null)
+            y.left.parent = x;
+        y.parent = x.parent;
+        if (x.parent is null)
+            root = y;
+        else if (x is x.parent.left)
+            x.parent.left = y;
+        else
+            x.parent.right = y;
+        y.left = x;
+        x.parent = y;
+    }
+
+    private static void rotRRoot(ref Node* root, Node* x) @nogc nothrow
+    {
+        auto y = x.left;
+        x.left = y.right;
+        if (y.right !is null)
+            y.right.parent = x;
+        y.parent = x.parent;
+        if (x.parent is null)
+            root = y;
+        else if (x is x.parent.right)
+            x.parent.right = y;
+        else
+            x.parent.left = y;
+        y.right = x;
+        x.parent = y;
+    }
+
+    // CLRS insert-fixup on a passed-in root (the exact logic proven in insertFixup,
+    // hoisted to a static root-ref form so join can rebalance a detached tree).
+    private static void fixupRoot(ref Node* root, Node* z) @nogc nothrow
+    {
+        while (z.parent !is null && z.parent.color == Color.red)
+        {
+            auto gp = z.parent.parent;
+            if (z.parent is gp.left)
+            {
+                auto y = gp.right; // uncle
+                if (y !is null && y.color == Color.red)
+                {
+                    z.parent.color = Color.black;
+                    y.color = Color.black;
+                    gp.color = Color.red;
+                    z = gp;
+                }
+                else
+                {
+                    if (z is z.parent.right)
+                    {
+                        z = z.parent;
+                        rotLRoot(root, z);
+                    }
+                    z.parent.color = Color.black;
+                    gp.color = Color.red;
+                    rotRRoot(root, gp);
+                }
+            }
+            else
+            {
+                auto y = gp.left; // uncle
+                if (y !is null && y.color == Color.red)
+                {
+                    z.parent.color = Color.black;
+                    y.color = Color.black;
+                    gp.color = Color.red;
+                    z = gp;
+                }
+                else
+                {
+                    if (z is z.parent.left)
+                    {
+                        z = z.parent;
+                        rotRRoot(root, z);
+                    }
+                    z.parent.color = Color.black;
+                    gp.color = Color.red;
+                    rotLRoot(root, gp);
+                }
+            }
+        }
+        root.color = Color.black;
+    }
+
+    // Combine TL, single node k, TR (keys(TL) < k.key < keys(TR)) into one valid
+    // RB-tree, O(|bh(TL)-bh(TR)|). TL/TR must be detached valid RB-trees with BLACK
+    // roots (or null). Rather than the fragile recursive "Just Join" base case (which
+    // must special-case null / red-leaf attach points), splice k as a RED node at the
+    // spine node whose black-height matches the shorter tree, then run the proven
+    // insert-fixup — the deeper tree can only be over-tall by red-red, exactly what
+    // insert-fixup repairs.
+    private static Node* join3(Node* TL, Node* k, Node* TR) @nogc nothrow
+    {
+        k.left = k.right = k.parent = null;
+        if (TL is null && TR is null)
+        {
+            k.color = Color.black;
+            return k;
+        }
+        immutable hl = bh(TL), hr = bh(TR);
+        Node* nroot;
+        if (hl >= hr)
+        {
+            // attach into TL (non-null here): descend its RIGHT spine to the black
+            // node c with bh(c)==hr (or to the rightmost null when hr==0), splice
+            // k=(c, TR) as a red node under c's parent.
+            nroot = TL;
+            Node* p = null, c = TL;
+            while (c !is null && (bh(c) > hr || c.color == Color.red))
+            {
+                p = c;
+                c = c.right;
+            }
+            k.color = Color.red;
+            k.left = c;
+            if (c !is null)
+                c.parent = k;
+            k.right = TR;
+            if (TR !is null)
+                TR.parent = k;
+            k.parent = p;
+            if (p is null)
+                nroot = k;
+            else
+                p.right = k;
+            fixupRoot(nroot, k);
+        }
+        else
+        {
+            // mirror: attach into TR's LEFT spine.
+            nroot = TR;
+            Node* p = null, c = TR;
+            while (c !is null && (bh(c) > hl || c.color == Color.red))
+            {
+                p = c;
+                c = c.left;
+            }
+            k.color = Color.red;
+            k.right = c;
+            if (c !is null)
+                c.parent = k;
+            k.left = TL;
+            if (TL !is null)
+                TL.parent = k;
+            k.parent = p;
+            if (p is null)
+                nroot = k;
+            else
+                p.left = k;
+            fixupRoot(nroot, k);
+        }
+        nroot.parent = null;
+        return nroot;
+    }
+
+    // Split subtree `t` (a valid RB-tree, detached) at `key` into (< key) and
+    // (> key); the equal node, if any, is returned via `mid` (detached, single).
+    private static void splitAt(Node* t, K key, out Node* lt, out Node* gt, out Node* mid) @nogc nothrow
+    {
+        if (t is null)
+        {
+            lt = gt = mid = null;
+            return;
+        }
+        t.parent = null;
+        immutable c = cmpKey(key, t.key);
+        if (c == 0)
+        {
+            lt = t.left;
+            if (lt !is null)
+            {
+                lt.parent = null;
+                lt.color = Color.black;
+            }
+            gt = t.right;
+            if (gt !is null)
+            {
+                gt.parent = null;
+                gt.color = Color.black;
+            }
+            mid = t;
+            return;
+        }
+        if (c < 0) // key < t.key: t and t.right go to the > side
+        {
+            Node* ll, lr, lm;
+            splitAt(t.left, key, ll, lr, lm);
+            lt = ll;
+            mid = lm;
+            auto rr = t.right;
+            if (rr !is null)
+            {
+                rr.parent = null;
+                rr.color = Color.black;
+            }
+            if (lr !is null)
+            {
+                lr.parent = null;
+                lr.color = Color.black;
+            }
+            gt = join3(lr, t, rr); // (lr) < t < (t.right)
+        }
+        else // key > t.key: t and t.left go to the < side
+        {
+            Node* rl, rr, rm;
+            splitAt(t.right, key, rl, rr, rm);
+            gt = rr;
+            mid = rm;
+            auto ll = t.left;
+            if (ll !is null)
+            {
+                ll.parent = null;
+                ll.color = Color.black;
+            }
+            if (rl !is null)
+            {
+                rl.parent = null;
+                rl.color = Color.black;
+            }
+            lt = join3(ll, t, rl); // (t.left) < t < (rl)
+        }
+    }
+
+    private static size_t subtreeCount(Node* t) @nogc nothrow
+    {
+        if (t is null)
+            return 0;
+        return 1 + subtreeCount(t.left) + subtreeCount(t.right);
+    }
+
+    /// Detach every entry with key <= `hi` as its own subtree (root returned),
+    /// leaving this map holding only `> hi`. O(log n). The caller OWNS the returned
+    /// subtree — walk it (`opApply`-style) to consume each entry, then free its
+    /// nodes with `disposeDetached`. Unlike `removeRight` (O(K) consuming range),
+    /// the map is repaired in one split, so the per-node teardown can run off the
+    /// hot path. Returns null when nothing is `<= hi`.
+    Node* detachLedge(K hi) @nogc nothrow @trusted
+    {
+        Node* lt, gt, mid;
+        splitAt(root, hi, lt, gt, mid); // (< hi), (> hi), (== hi node or null)
+        Node* le; // the whole `<= hi` side
+        if (mid !is null)
+        {
+            mid.left = mid.right = null;
+            mid.parent = null;
+            mid.color = Color.black;
+            le = (lt is null) ? mid : join3(lt, mid, null);
+        }
+        else
+            le = lt;
+        if (le !is null)
+            le.color = Color.black;
+        if (gt !is null)
+            gt.color = Color.black;
+        // repair the map: it now holds only `> hi`
+        immutable removed = subtreeCount(le);
+        root = gt;
+        count -= removed;
+        _min = (gt is null) ? null : minimum(gt);
+        return le;
+    }
+
+    /// Free a subtree returned by `detachLedge` after you've consumed its entries
+    /// (runs each node's K/V destructor + releases the node). Node memory goes to
+    /// the OS, not this map's recycle pool (the detached side may be freed off the
+    /// event loop, so it must not touch shared state).
+    static void disposeDetached(Node* t) @nogc nothrow @trusted
+    {
+        if (t is null)
+            return;
+        disposeDetached(t.left);
+        disposeDetached(t.right);
+        Allocator.instance.dispose(t);
+    }
+
+    /// In-order walk of a detached subtree (from `detachLedge`), ascending.
+    static int walkDetached(Node* t, scope int delegate(ref K, ref V) @nogc nothrow dg) @nogc nothrow
+    {
+        return walk(t, dg);
+    }
+
+    version (unittest)
+    {
+        // Full RB-invariant check for a subtree. Returns the black-height (black
+        // nodes on any root->null path, counting the null leaf) or -1 if ANY of:
+        // BST order (bounded by lo/hi), no red-red, uniform black-height, coherent
+        // parent pointers is violated. lo/hi are open bounds (null = unbounded).
+        static int rbCheck(Node* n, Node* par, const(K)* lo, const(K)* hi) @nogc nothrow
+        {
+            if (n is null)
+                return 1; // black null leaf contributes 1
+            if (n.parent !is par)
+                return -1;
+            if (lo !is null && !(cmpKey(*lo, n.key) < 0))
+                return -1;
+            if (hi !is null && !(cmpKey(n.key, *hi) < 0))
+                return -1;
+            if (n.color == Color.red
+                    && ((n.left !is null && n.left.color == Color.red)
+                        || (n.right !is null && n.right.color == Color.red)))
+                return -1;
+            immutable lh = rbCheck(n.left, n, lo, &n.key);
+            immutable rh = rbCheck(n.right, n, &n.key, hi);
+            if (lh < 0 || rh < 0 || lh != rh)
+                return -1;
+            return lh + (n.color == Color.black ? 1 : 0);
+        }
+
+        // The whole map is a valid RB-tree AND its cached `_min`/`count` agree with
+        // the structure.
+        bool validate() @nogc nothrow
+        {
+            if (root !is null && root.color != Color.black)
+                return false;
+            if (rbCheck(root, null, null, null) < 0)
+                return false;
+            if (_min !is (root is null ? null : minimum(root)))
+                return false;
+            return subtreeCount(root) == count;
+        }
+
+        // A DETACHED subtree (from detachLedge): valid RB-tree, parent-less black
+        // root (no _min/count — those belong to the map it was split from).
+        static bool validateDetached(Node* t) @nogc nothrow
+        {
+            if (t is null)
+                return true;
+            if (t.parent !is null || t.color != Color.black)
+                return false;
+            return rbCheck(t, null, null, null) >= 0;
+        }
+    }
+
     /// In-order (ascending key) iteration.
     int opApply(scope int delegate(ref K, ref V) @nogc nothrow dg) @nogc nothrow
     {
@@ -1211,6 +1580,69 @@ struct OrderedSet(T, Allocator = Mallocator)
     {
     }
     assert(m.empty);
+}
+
+@nogc nothrow unittest // detachLedge (RB split): BOTH sides valid RB-trees, exact <= hi partition, counts add up
+{
+    uint seed = 0x9E37_79B9;
+    foreach (round; 0 .. 3000)
+    {
+        Map!(int, int) m;
+        bool[512] present = false;
+        size_t live = 0;
+
+        seed = seed * 1_664_525 + 1_013_904_223;
+        immutable count = seed % 400; // 0..399 inserts → varied tree shapes/heights
+        foreach (_; 0 .. count)
+        {
+            seed = seed * 1_664_525 + 1_013_904_223;
+            immutable key = cast(int)(seed % 512);
+            if (!present[key])
+            {
+                present[key] = true;
+                live++;
+            }
+            m.set(key, key * 7);
+        }
+        assert(m.validate());
+        assert(m.length == live);
+
+        seed = seed * 1_664_525 + 1_013_904_223;
+        immutable hi = cast(int)(seed % 560) - 24; // sometimes below the min / above the max
+
+        size_t expectDetached = 0; // reference partition: keys <= hi
+        foreach (k; 0 .. 512)
+            if (present[k] && k <= hi)
+                expectDetached++;
+
+        auto det = m.detachLedge(hi);
+
+        // the map keeps only > hi and is STILL a valid RB-tree; the detached side is one too
+        assert(m.validate());
+        assert(Map!(int, int).validateDetached(det));
+        assert(m.length == live - expectDetached);
+
+        // detached = exactly the <= hi keys, ascending, values intact
+        size_t seen = 0;
+        int last = int.min;
+        cast(void) Map!(int, int).walkDetached(det, (ref int k, ref int v) @nogc nothrow{
+            assert(k > last);
+            last = k;
+            assert(k <= hi);
+            assert(v == k * 7);
+            assert(present[k]);
+            seen++;
+            return 0;
+        });
+        assert(seen == expectDetached);
+
+        // remaining map = exactly the > hi keys, still reachable by lookup
+        foreach (k; 0 .. 512)
+            if (present[k])
+                assert((m.get(k) !is null) == (k > hi));
+
+        Map!(int, int).disposeDetached(det);
+    }
 }
 
 @nogc nothrow unittest // OrderedSet: membership, in, dedup, ordered iteration
