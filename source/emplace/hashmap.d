@@ -338,6 +338,28 @@ struct HashMap(V, Allocator = Mallocator)
         return true;
     }
 
+    /// Off-loop free support (lazyfree): record every backing block via `add`,
+    /// freeing NOTHING — the table array, each key slice, and (via `gatherVal`) each
+    /// value's owned blocks. Mirrors free()/clear() exactly so the caller can
+    /// deallocate the gathered blocks later with no leak and no double-free. POD
+    /// values pass no `gatherVal`. Read-only: the map is left intact (its owner is
+    /// discarded after this returns).
+    void gatherBlocks(scope void delegate(void*, size_t) @nogc nothrow add,
+            scope void delegate(ref V) @nogc nothrow gatherVal = null) @nogc nothrow @trusted
+    {
+        if (slots is null)
+            return;
+        add(cast(void*) slots, cap * Slot.sizeof); // the table array (one block)
+        foreach (i; 0 .. cap)
+            if (slots[i].state == SlotState.used)
+            {
+                if (slots[i].key.length) // key slice: mallocDup'd to exactly key.length
+                    add(cast(void*) slots[i].key.ptr, slots[i].key.length);
+                if (gatherVal !is null)
+                    gatherVal(slots[i].val);
+            }
+    }
+
     // Index-based iteration for @nogc callers that cannot afford closures.
     @property size_t capacity() const
     {
