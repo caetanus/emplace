@@ -448,12 +448,36 @@ struct Map(K, V, Allocator = Mallocator)
         return n;
     }
 
+    // In-order successor of a node already in the tree (null past the max). Used
+    // by the consuming range to advance without re-descending from the root.
+    private static Node* successor(Node* n) @nogc nothrow
+    {
+        if (n.right !is null)
+            return minimum(n.right);
+        auto p = n.parent;
+        while (p !is null && n is p.right)
+        {
+            n = p;
+            p = p.parent;
+        }
+        return p;
+    }
+
     /// Remove `key` if present; returns true when a node was removed.
     bool remove(K key) @nogc nothrow @trusted
     {
         auto z = find(key);
         if (z is null)
             return false;
+        removeNode(z);
+        return true;
+    }
+
+    // Remove a node we ALREADY hold — skips the O(log n) redundant find(). The
+    // consuming range drains via this, turning popFront from two descents (a
+    // re-find + a minimum(root)) into O(1) amortised per node.
+    private void removeNode(Node* z) @nogc nothrow @trusted
+    {
         Node* y = z;
         Color yColor = y.color;
         Node* x, xParent;
@@ -492,7 +516,6 @@ struct Map(K, V, Allocator = Mallocator)
             deleteFixup(x, xParent);
         recycle(z); // keep the node memory for the next insert
         count--;
-        return true;
     }
 
     /// A consuming range over every entry with key <= `hi` (the `bisect_right`
@@ -514,6 +537,8 @@ struct Map(K, V, Allocator = Mallocator)
 
         private void seek() @nogc nothrow
         {
+            // One initial descent to the smallest key; thereafter we advance by
+            // in-order successor (no re-descent from the root).
             _cur = _map.root is null ? null : minimum(_map.root);
             if (_cur !is null && cmpKey(_cur.key, _hi) > 0)
                 _cur = null; // smallest key is past hi: range exhausted
@@ -531,8 +556,12 @@ struct Map(K, V, Allocator = Mallocator)
 
         void popFront() @nogc nothrow @trusted
         {
-            _map.remove(_cur.key); // dispose the entry we just yielded
-            seek(); // next smallest, still <= hi
+            // `_cur` is the current minimum (no left child), so its successor is
+            // valid and stable across the rebalance below. Compute it FIRST, then
+            // remove `_cur` by pointer (no re-find), then step — O(1) amortised.
+            Node* nxt = successor(_cur);
+            _map.removeNode(_cur);
+            _cur = (nxt !is null && cmpKey(nxt.key, _hi) <= 0) ? nxt : null;
         }
     }
 
