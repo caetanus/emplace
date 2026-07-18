@@ -67,6 +67,9 @@ struct Map(K, V, Allocator = Mallocator)
     private Node* root;
     private size_t count;
     private Node* freePool; // recycled node memory (singly linked via .parent)
+    private Node* _min; // cached leftmost node (rb_first_cached): O(1) find-min for
+    // the consuming drain / any min query. A new node is the min iff inserted as
+    // the left child of the current min; removing the min advances it to successor.
 
     // Copyable when both key and value are copyable — a deep clone of the node
     // graph (structure + colors preserved; the copy does NOT share the source's
@@ -78,6 +81,7 @@ struct Map(K, V, Allocator = Mallocator)
             auto srcRoot = root; // fields were bit-copied from the source
             root = cloneSubtree(srcRoot, null);
             freePool = null; // a fresh map's own recycle pool
+            _min = root is null ? null : minimum(root); // clone owns its own min ptr
             // `count` is already the source's count (correct for the copy)
         }
 
@@ -228,6 +232,8 @@ struct Map(K, V, Allocator = Mallocator)
         else
             parent.right = n;
         count++;
+        if (parent is null || (parent is _min && lastCmp < 0))
+            _min = n; // new leftmost iff inserted under the old min's (null) left
         insertFixup(n);
     }
 
@@ -318,6 +324,8 @@ struct Map(K, V, Allocator = Mallocator)
         else
             parent.right = n;
         count++;
+        if (parent is null || (parent is _min && lastCmp < 0))
+            _min = n; // new leftmost iff inserted under the old min's (null) left
         insertFixup(n);
         return &n.val;
     }
@@ -354,6 +362,8 @@ struct Map(K, V, Allocator = Mallocator)
         else
             parent.right = n;
         count++;
+        if (parent is null || (parent is _min && lastCmp < 0))
+            _min = n; // new leftmost iff inserted under the old min's (null) left
         insertFixup(n);
         return &n.val;
     }
@@ -552,6 +562,10 @@ struct Map(K, V, Allocator = Mallocator)
     // re-find + a minimum(root)) into O(1) amortised per node.
     private void removeNode(Node* z) @nogc nothrow @trusted
     {
+        // Advance the cached min BEFORE the structural edit: the leftmost has no
+        // left child, so its successor is the next-smallest and stays valid.
+        if (z is _min)
+            _min = successor(z);
         Node* y = z;
         Color yColor = y.color;
         Node* x, xParent;
@@ -611,9 +625,9 @@ struct Map(K, V, Allocator = Mallocator)
 
         private void seek() @nogc nothrow
         {
-            // One initial descent to the smallest key; thereafter we advance by
-            // in-order successor (no re-descent from the root).
-            _cur = _map.root is null ? null : minimum(_map.root);
+            // O(1) via the cached leftmost; thereafter we advance by in-order
+            // successor (no re-descent from the root).
+            _cur = _map._min;
             if (_cur !is null && cmpKey(_cur.key, _hi) > 0)
                 _cur = null; // smallest key is past hi: range exhausted
         }
@@ -824,6 +838,7 @@ struct Map(K, V, Allocator = Mallocator)
         freeSubtree(root);
         root = null;
         count = 0;
+        _min = null;
         while (freePool !is null) // return recycled node memory to the OS
         {
             auto n = freePool;

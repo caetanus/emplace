@@ -406,6 +406,18 @@ struct Vector(T, Allocator = Mallocator)
             _len++;
         }
 
+        /// Append an element CONSTRUCTED in place from `args` — no temporary T is
+        /// materialised and moved (the eponymous operation). Works for move-only
+        /// and non-copyable T; `emplaceBack()` default-constructs.
+        void emplaceBack(Args...)(auto ref Args args) @trusted
+        {
+            import core.lifetime : emplace, forward;
+
+            ensure(_len + 1);
+            emplace(&_ptr[_len], forward!args);
+            _len++;
+        }
+
         /// Append a slice (bulk). Copyable elements only; a single memcpy for POD.
         static if (__traits(compiles, { T t = T.init; T u = t; }))
             void put(scope const(T)[] xs) @trusted
@@ -687,4 +699,29 @@ version (unittest) private struct VCounter
     a.clear();
     a.shrinkToFit();
     assert(a.empty && a._words is null && a._cap == 0); // freed at empty
+}
+
+@nogc nothrow unittest // emplaceBack constructs in place — no copy/move of the element
+{
+    static struct C
+    {
+        int x;
+        static int copies;
+        this(int v) @nogc nothrow
+        {
+            x = v;
+        }
+
+        this(this) @nogc nothrow
+        {
+            ++copies;
+        }
+    }
+
+    C.copies = 0;
+    Vector!C v;
+    v.emplaceBack(5);
+    v.emplaceBack(9);
+    assert(C.copies == 0, "emplaceBack must not copy the element");
+    assert(v.length == 2 && v[0].x == 5 && v[1].x == 9);
 }

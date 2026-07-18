@@ -165,6 +165,16 @@ struct Deque(T, Allocator = Mallocator)
         _len++;
     }
 
+    /// Append at the back CONSTRUCTED in place from `args` — no temporary T built.
+    void emplaceBack(Args...)(auto ref Args args) @trusted
+    {
+        import core.lifetime : emplace, forward;
+
+        ensure(_len + 1);
+        emplace(&_ptr[phys(_len)], forward!args);
+        _len++;
+    }
+
     /// Prepend at the front.
     void pushFront(T x) @trusted
     {
@@ -174,6 +184,17 @@ struct Deque(T, Allocator = Mallocator)
             _ptr[_head] = x;
         else
             moveEmplace(x, _ptr[_head]);
+        _len++;
+    }
+
+    /// Prepend at the front CONSTRUCTED in place from `args` — no temporary T built.
+    void emplaceFront(Args...)(auto ref Args args) @trusted
+    {
+        import core.lifetime : emplace, forward;
+
+        ensure(_len + 1);
+        _head = (_head + _cap - 1) & (_cap - 1);
+        emplace(&_ptr[_head], forward!args);
         _len++;
     }
 
@@ -380,6 +401,31 @@ version (unittest) private struct DCounter
         assert(DCounter.live == 3);
     }
     assert(DCounter.live == 0);
+}
+
+@nogc nothrow unittest // emplaceBack/emplaceFront construct in place — no copy
+{
+    static struct C
+    {
+        int x;
+        static int copies;
+        this(int v) @nogc nothrow
+        {
+            x = v;
+        }
+
+        this(this) @nogc nothrow
+        {
+            ++copies;
+        }
+    }
+
+    C.copies = 0;
+    Deque!C d;
+    d.emplaceBack(1);
+    d.emplaceFront(2);
+    assert(C.copies == 0, "emplace must not copy the element");
+    assert(d.length == 2 && d.front.x == 2 && d.back.x == 1);
 }
 
 @nogc nothrow unittest // move-only element (Uniq): deque is move-only, frees each

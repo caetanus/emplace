@@ -249,6 +249,30 @@ struct HashMap(V, Allocator = Mallocator)
         return true;
     }
 
+    /// Insert `k` CONSTRUCTING its value in place from `args` if the key is absent
+    /// — no temporary V is materialised and moved (the eponymous operation). An
+    /// existing key keeps its value and ignores `args` (getOrPut-style); returns a
+    /// pointer to the value either way. `emplace(k)` default-constructs.
+    V* emplace(Args...)(scope const(char)[] k, auto ref Args args)
+    {
+        import core.lifetime : emplaceInit = emplace, forward;
+
+        maybeGrow();
+        auto h = fnv1a(k);
+        bool found;
+        auto i = findSlot(k, h, found);
+        if (found)
+            return &slots[i].val; // present: keep, ignore args
+        if (slots[i].state == SlotState.empty)
+            fill++;
+        slots[i].state = SlotState.used;
+        slots[i].hash = h;
+        slots[i].key = mallocDup!Allocator(k);
+        emplaceInit(&slots[i].val, forward!args);
+        used++;
+        return &slots[i].val;
+    }
+
     /// Pointer to the live value, or null. Valid until the next set/del.
     inout(V)* get(scope const(char)[] k) inout
     {
@@ -565,6 +589,31 @@ version (unittest) private struct Owned // a `.free()`-convention value
     s.add("a");
     s.add("a");
     assert(s.length == 1 && "a" in s && !("b" in s));
+}
+
+@nogc nothrow unittest // emplace constructs the value in place — no copy/move
+{
+    static struct C
+    {
+        int x;
+        static int copies;
+        this(int v) @nogc nothrow
+        {
+            x = v;
+        }
+
+        this(this) @nogc nothrow
+        {
+            ++copies;
+        }
+    }
+
+    C.copies = 0;
+    HashMap!C m;
+    m.emplace("a", 5);
+    assert(C.copies == 0, "emplace must not copy the value");
+    assert(m.emplace("a", 9).x == 5); // present: kept, args ignored
+    assert(C.copies == 0 && m.get("a").x == 5 && m.length == 1);
 }
 
 // PROOF that a HashMap (which now has `~this`) is safe as a by-value UNION member
