@@ -17,24 +17,27 @@ module emplace.hashmap;
 // inside a union — call `free()` explicitly when done.
 
 import core.lifetime : moveEmplace;
-import core.stdc.stdlib : calloc, malloc, cfree = free;
-import core.stdc.string : memcpy;
+import core.stdc.string : memcpy, memset;
+import std.experimental.allocator.mallocator : Mallocator;
 import std.traits : hasElaborateDestructor;
 
-private const(char)[] mallocDup(scope const(char)[] s) @nogc nothrow @trusted
+// Key-string dup/free go through the map's Allocator (Mallocator by default, so
+// this is malloc/free unchanged). The freed length is known (the stored key), so
+// a size-aware allocator (region/freelist) can return the block to its bucket.
+private const(char)[] mallocDup(Allocator)(scope const(char)[] s) @nogc nothrow @trusted
 {
     if (s.length == 0)
         return "";
-    auto p = cast(char*) malloc(s.length);
-    assert(p !is null, "out of memory");
-    memcpy(p, s.ptr, s.length);
-    return p[0 .. s.length];
+    auto b = Allocator.instance.allocate(s.length);
+    assert(b.ptr !is null, "out of memory");
+    memcpy(b.ptr, s.ptr, s.length);
+    return cast(const(char)[]) b;
 }
 
-private void freeSlice(scope const(char)[] s) @nogc nothrow @trusted
+private void freeSlice(Allocator)(scope const(char)[] s) @nogc nothrow @trusted
 {
     if (s.length)
-        cfree(cast(void*) s.ptr);
+        Allocator.instance.deallocate(cast(void[])(cast(char[]) s));
 }
 
 private ulong fnv1a(scope const(char)[] s) @nogc nothrow
@@ -66,7 +69,7 @@ private enum SlotState : ubyte
 // member is active), so the union's owner keeps freeing by tag and there is no
 // double-free — no dtorless variant is needed. The `union member dtor` unittest
 // at the bottom pins that language guarantee.
-struct HashMap(V)
+struct HashMap(V, Allocator = Mallocator)
 {
     private static struct Slot
     {
@@ -131,7 +134,7 @@ struct HashMap(V)
         clear();
         if (slots !is null)
         {
-            cfree(slots);
+            Allocator.instance.deallocate((cast(void*) slots)[0 .. cap * Slot.sizeof]);
             slots = null;
             cap = 0;
         }
@@ -144,7 +147,7 @@ struct HashMap(V)
         {
             if (slots[i].state == SlotState.used)
             {
-                freeSlice(slots[i].key);
+                freeSlice!Allocator(slots[i].key);
                 disposeVal(slots[i].val);
             }
             slots[i] = Slot.init;
@@ -193,8 +196,10 @@ struct HashMap(V)
 
     private void rehash(size_t ncap) @trusted
     {
-        auto nslots = cast(Slot*) calloc(ncap, Slot.sizeof);
-        assert(nslots !is null, "out of memory");
+        auto nb = Allocator.instance.allocate(ncap * Slot.sizeof);
+        assert(nb.ptr !is null, "out of memory");
+        memset(nb.ptr, 0, nb.length); // allocate isn't zeroed; slots must start `empty`
+        auto nslots = cast(Slot*) nb.ptr;
         size_t mask = ncap - 1;
         foreach (i; 0 .. cap)
         {
@@ -206,7 +211,7 @@ struct HashMap(V)
             moveEmplace(slots[i], nslots[j]); // move the whole slot (works for move-only values)
         }
         if (slots !is null)
-            cfree(slots);
+            Allocator.instance.deallocate((cast(void*) slots)[0 .. cap * Slot.sizeof]);
         slots = nslots;
         cap = ncap;
         fill = used;
@@ -238,7 +243,7 @@ struct HashMap(V)
             fill++;
         slots[i].state = SlotState.used;
         slots[i].hash = h;
-        slots[i].key = mallocDup(k);
+        slots[i].key = mallocDup!Allocator(k);
         moveEmplace(val, slots[i].val);
         used++;
         return true;
@@ -282,7 +287,7 @@ struct HashMap(V)
         auto i = findSlot(k, fnv1a(k), found);
         if (!found)
             return false;
-        freeSlice(slots[i].key);
+        freeSlice!Allocator(slots[i].key);
         disposeVal(slots[i].val);
         slots[i] = Slot.init;
         slots[i].state = SlotState.tomb;
@@ -301,7 +306,7 @@ struct HashMap(V)
         auto i = findSlot(k, fnv1a(k), found);
         if (!found)
             return false;
-        freeSlice(slots[i].key);
+        freeSlice!Allocator(slots[i].key);
         moveEmplace(slots[i].val, val);
         slots[i] = Slot.init;
         slots[i].state = SlotState.tomb;
@@ -423,7 +428,7 @@ version (unittest) private struct Owned // a `.free()`-convention value
     static Owned of(int tag) @nogc nothrow
     {
         Owned o;
-        o.p = cast(char*) malloc(1);
+        o.p = cast(char*) Mallocator.instance.allocate(1).ptr;
         *o.p = cast(char) tag;
         live++;
         return o;
@@ -433,7 +438,7 @@ version (unittest) private struct Owned // a `.free()`-convention value
     {
         if (p)
         {
-            cfree(p);
+            Mallocator.instance.deallocate(p[0 .. 1]);
             p = null;
             live--;
         }
