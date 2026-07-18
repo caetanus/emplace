@@ -41,6 +41,19 @@ private enum Color : ubyte
     black
 }
 
+// Hint the CPU to pull a node's cache line while we still work on the current
+// one — a tree descent is a dependent pointer-chase, so prefetching both children
+// hides most of the next level's miss latency. No-op outside LDC.
+private void prefetchR(const(void)* p) @nogc nothrow pure @trusted
+{
+    version (LDC)
+    {
+        import ldc.intrinsics : llvm_prefetch;
+
+        llvm_prefetch(p, 0, 3, 1); // read, high locality, data cache
+    }
+}
+
 struct Map(K, V, Allocator = Mallocator)
 {
     private struct Node
@@ -119,6 +132,27 @@ struct Map(K, V, Allocator = Mallocator)
             n = Allocator.instance.make!Node;
         n.key = key;
         n.val = val;
+        n.left = n.right = n.parent = null;
+        n.color = Color.red;
+        return n;
+    }
+
+    // Like `alloc`, but CONSTRUCTS the value in place from `args` — no temporary V
+    // is built and copied. Backs the `emplace` API.
+    private Node* allocEmplace(Args...)(K key, auto ref Args args) @nogc nothrow @trusted
+    {
+        import core.lifetime : emplace, forward;
+
+        Node* n;
+        if (freePool !is null) // reuse a recycled node — no malloc
+        {
+            n = freePool;
+            freePool = n.parent;
+        }
+        else
+            n = Allocator.instance.make!Node;
+        n.key = key;
+        emplace(&n.val, forward!args); // placement-construct V from args
         n.left = n.right = n.parent = null;
         n.color = Color.red;
         return n;
@@ -266,6 +300,8 @@ struct Map(K, V, Allocator = Mallocator)
         auto cur = root;
         while (cur !is null)
         {
+            prefetchR(cur.left);
+            prefetchR(cur.right);
             immutable c = cmpKey(key, cur.key);
             if (c == 0)
                 return &cur.val; // already present: keep it
@@ -286,11 +322,49 @@ struct Map(K, V, Allocator = Mallocator)
         return &n.val;
     }
 
+    /// Insert `key` CONSTRUCTING its value in place from `args` — no temporary V is
+    /// materialised and copied (the eponymous operation this package was missing).
+    /// If `key` already exists its value is kept and `args` ignored, like getOrPut;
+    /// returns a pointer to the value either way. `emplace(key)` (no args) default-
+    /// constructs the value.
+    V* emplace(Args...)(K key, auto ref Args args) @nogc nothrow @trusted return
+    {
+        import core.lifetime : forward;
+
+        Node* parent = null;
+        int lastCmp = 0;
+        auto cur = root;
+        while (cur !is null)
+        {
+            prefetchR(cur.left);
+            prefetchR(cur.right);
+            immutable c = cmpKey(key, cur.key);
+            if (c == 0)
+                return &cur.val; // already present: keep it, ignore args
+            parent = cur;
+            lastCmp = c;
+            cur = c < 0 ? cur.left : cur.right;
+        }
+        auto n = allocEmplace(key, forward!args);
+        n.parent = parent;
+        if (parent is null)
+            root = n;
+        else if (lastCmp < 0)
+            parent.left = n;
+        else
+            parent.right = n;
+        count++;
+        insertFixup(n);
+        return &n.val;
+    }
+
     private Node* find(K key) @nogc nothrow
     {
         auto cur = root;
         while (cur !is null)
         {
+            prefetchR(cur.left);
+            prefetchR(cur.right);
             immutable c = cmpKey(key, cur.key);
             if (c == 0)
                 return cur;
@@ -1061,6 +1135,38 @@ struct OrderedSet(T, Allocator = Mallocator)
     foreach (i; 0 .. 200)
         m.set(i, i * 2); // served from the recycle pool, not fresh malloc
     assert(m.length == 200 && *m.get(150) == 300);
+}
+
+@nogc nothrow unittest // emplace: constructs the value IN PLACE — no copy/move of V
+{
+    static struct Counted
+    {
+        int x;
+        static int copies;
+        this(int v) @nogc nothrow
+        {
+            x = v;
+        }
+
+        this(this) @nogc nothrow
+        {
+            ++copies;
+        }
+    }
+
+    Counted.copies = 0;
+    Map!(int, Counted) m;
+    auto p = m.emplace(7, 42); // Counted(42) built directly in the node
+    assert(p.x == 42 && m.length == 1);
+    assert(Counted.copies == 0, "emplace must not copy/move the value");
+
+    // existing key: value kept, args ignored, still no copy
+    assert(m.emplace(7, 999).x == 42);
+    assert(Counted.copies == 0);
+
+    // emplace(key) with no args default-constructs
+    Map!(int, Counted) d;
+    assert(d.emplace(1).x == 0 && d.length == 1);
 }
 
 @nogc nothrow unittest // removeRight: consuming range drains the <= hi prefix in order
