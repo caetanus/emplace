@@ -298,6 +298,20 @@ struct Deque(T, Allocator = Mallocator)
         return _len;
     }
 
+    /// Feed every backing block to `add` WITHOUT freeing — for off-loop (lazyfree)
+    /// deallocation by the caller. Reports each element's own blocks (when `T` has a
+    /// `gatherBlocks`) plus the ring buffer itself. Read-only; the caller discards the
+    /// deque afterwards (its `~this` must NOT run, or the blocks free twice).
+    void gatherBlocks(scope void delegate(void*, size_t) @nogc nothrow add) @nogc nothrow @trusted
+    {
+        if (_ptr is null)
+            return;
+        static if (__traits(hasMember, T, "gatherBlocks"))
+            foreach (i; 0 .. _len)
+                _ptr[phys(i)].gatherBlocks(add);
+        add(cast(void*) _ptr, _cap * T.sizeof);
+    }
+
     /// Forward range over the elements in logical (front→back) order. A view: it
     /// does not consume the deque and `save` snapshots the position.
     static struct Range
