@@ -30,7 +30,12 @@ struct Deque(T, Allocator = Mallocator)
     private size_t _head; // physical index of the front element (when _len > 0)
     private size_t _len;
 
-    private enum bool pod = __traits(isPOD, T);
+    // A type with a `.free()` convention OWNS heap memory even when it is
+    // __traits(isPOD) (no dtor/postblit) — e.g. dreads' StrVal. It is NOT plain
+    // data: it must take the dispose/move paths, never the bitwise POD fast-path
+    // (which skips disposeElem on pop/clear/~this and would LEAK it).
+    private enum bool hasFree = __traits(compiles, (ref T x) { x.free(); });
+    private enum bool pod = __traits(isPOD, T) && !hasFree;
 
     private static void disposeElem(ref T x) @trusted
     {
